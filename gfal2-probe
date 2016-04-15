@@ -1,0 +1,640 @@
+#!/usr/bin/env python
+
+##############################################################################
+#
+# NAME:        #gfal2-probe.py
+#
+# FACILITY:    SAM (Service Availability Monitoring)
+#
+# Copyright (C) CERN 2016
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+#   In applying this licence, CERN does not waive the privileges and immunities
+#   granted to it by virtue of its status as an Intergovernmental Organization or
+#   submit itself to any jurisdiction.
+#
+#
+# DESCRIPTION:
+#
+#         Nagios SAM metrics.
+#
+# AUTHORS:     Salvatore A. Tupputi, INFN-CNAF
+#
+# CREATED:     20-Aug-2013
+#
+# VERSION:     1.3
+# MODIFIED:    20-Aug-2013
+# NOTES:       
+#              
+#
+#  standard usage
+#  python gfal2-probe -H hostname -x proxypath --vo VO --vofqan /atlas/Role=production (-p metricchain or -m test)
+#
+#
+##############################################################################
+
+"""
+gfal2 metrics for storage elements.
+
+Salvatore A. Tupputi <salvatore.a.tupputi@cnaf.infn.it>
+INFN-CNAF
+WLCG SAM (Service Availability Monitoring)
+"""
+
+import os
+import sys
+import getopt
+import signal
+import urllib2
+import datetime
+import socket
+import time
+import logging
+import traceback
+import logging
+import argparse
+from random import choice
+import json
+
+#gridmon stuff
+from gridmon.nagios import nagios
+
+#gfal2
+try:
+    import gfal2
+except ImportError,e:
+    summary = "UNKNOWN: Error loading modules : %s" % (e)
+    sys.stdout.write(summary+'\n')
+    sys.stdout.write(summary+'\nsys.path: %s\n'% str(sys.path))
+    sys.exit(3)
+
+class TimeoutException(Exception):
+    pass
+
+def timeout_handler(sig, stack):
+    logging.critical('HANDLING TIMEOUT\n')
+    raise TimeoutException()
+
+
+class DDMMetrics(object):
+    """A Metric Gatherer specific for DDM endpoints."""
+
+    def __init__(self):
+
+        #Lay down the helper arguments breakdown
+        parser = argparse.ArgumentParser(description="Basic SE tests for storage endpoints status assessment")
+
+        parser.add_argument("-H", "--hostname",
+                            help="Hostname where a service to be tested is running on",
+                            metavar="FQDN")
+        parser.add_argument("--vo",
+                            help="Virtual Organization. (Deafult: atlas)",
+                            default="atlas", metavar="<name>")
+        ####################### should certificate validity be checked beforehand?
+        parser.add_argument("-x",
+                            help="VOMS proxy (Order: -x, X509_USER_PROXY, /tmp/x509up_u<ID>)",
+                            metavar="X509_PROXY")
+        parser.add_argument("--vofqan",
+                            help="VOMS primary attribute as FQAN. If given, will be used along with --vo",
+                            metavar="<name>")
+        parser.add_argument("-tk","--tokens",
+                            help="List with name(s) of the token(s) the probe has to act upon. The list order has to match with --endpoints option",
+                            nargs='*')
+        parser.add_argument("-ep","--endpoints",
+                            help="List with name(s) of the endpoint(s) the probe has to act upon. The list order has to match with --tokens option",
+                            nargs='*')
+        parser.add_argument("-m","--metrics",
+                            help="List with name(s) of the test(s) to be executed.",
+                            nargs='*')
+        parser.add_argument("-p","--metricprofile",
+                            help="Active+passive metrics profile. Values are: Put, Get, Del. None or one at most can be specified.",
+                            default='', type=str)
+        parser.add_argument("-f","--flavour",
+                            help="Protocol against which endpoints are going to be tested",
+                            default='srm', type=str)
+
+        args = parser.parse_args()
+        if (args.hostname is None or args.x is None):
+            sys.exit("ERROR: at least hostname and certificate arguments need to be provided\nType \'-h\' for arguments description")
+        '''
+        if ((args.endpoints is None and args.tokens is not None) or
+            (args.endpoints is None and args.metrics is not None) or
+            (args.tokens is None and args.metrics is not None) or
+            (args.tokens is None and args.endpoints is not None) or
+            (args.metrics is None and args.tokens is not None) or
+            (args.metrics is None and args.endpoints is not None) ):
+            sys.exit("ERROR: inconsistent arguments for endpoints, tokens, metrics fields!\nType \'-h\' for arguments description")
+        '''
+        if ( ( args.endpoints is not None and args.tokens is not None and args.metrics is not None) and
+            len(args.endpoints) + len(args.tokens) - 2*len(args.metrics) != 0):
+            sys.exit("ERROR: Endpoints, tokens and metrics objects need to have the same length!. Exiting...")
+
+        self.exc_msg = 'Exception of type {0}. Exception details:\n{1!r}'
+
+        self.childTimeout = 120 # timeout
+        self.threshold = 0.67 # CRITICAL tests threshold for turning to CRITICAL when running multiple tests
+        self.wThreshold = 0.5 # CRITICAL tests threshold for turning to WARNING when running multiple tests
+        self.tokThreshold = 0.5 # tokens threshold for changing the overall status
+
+        self.hostName = args.hostname
+
+        self.endpoints = args.endpoints
+        self.actedtokens = args.tokens
+
+        self.metrics = args.metrics
+        self.tokens = ('LsDir_' + args.metricprofile + '_' + args.metricprofile,'')[not args.metricprofile]
+
+        self.workdir_run = '/var/lib/gridprobes/'
+        self.ns = 'org.'+args.vo
+        self.workdir_service = 'DDM' # to be changed with an agreed upon name?
+        self.fqan = args.vofqan
+        self.fqan_path = self.fqan.replace('/Role','.Role')
+
+        self.workdir_general = self.workdir_run+self.fqan_path+'/'+self.ns+'/'+self.workdir_service+'/'
+        self.workdir_metric = self.workdir_general+self.hostName
+
+        self.tested_tokens = [ 'ATLASDATADISK', 'ATLASGROUPDISK', 'ATLASLOCALGROUPDISK', 'ATLASSCRATCHDISK' ] # ATLAS SPECIFIC to be soon dropped
+        self.protocol = args.flavour
+
+        # files and patterns
+        self._fileTest = self.workdir_metric+'/testFile.txt'
+        self._filePattern = 'SAM/testfile-TEST-TOKEN-%s-%s.txt'
+        prot_id = (self.protocol+'-','')[self.protocol == 'srm']
+        self._getFilePattern = 'SAM/testfile-' + prot_id + 'GET-TOKEN.txt'
+        self._fileTestGet = self.workdir_metric+'/testFileGet.txt'
+        prepr_host = socket.gethostbyname_ex('etf-' + args.vo + '-preprod')[0]
+        this_host = socket.gethostname()
+        if this_host == prepr_host:
+            self._getFilePattern = self._getFilePattern.replace('testfile','testfile-prep')
+        if self.protocol == 'root':
+            self._fileTestGet = self._fileTestGet.replace('Get','GetXRootD')
+        if self.protocol == 'https':
+            self._fileTestGet = self._fileTestGet.replace('Get','GetHttps')
+
+        self.logfile = '/SAMLogfile.txt'
+        self.tmp_logfile = '/SAMLogfile.txt.tmp'
+
+        if not os.path.exists(self.workdir_metric):
+            os.makedirs(self.workdir_metric)
+            ft = open(self._fileTest,'w')
+            ft.write('0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n')
+            ft.close()
+            ftg = open(self._fileTestGet,'w')
+            ftg.write('0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n')
+            ftg.close()
+
+
+        self.feed_filename = 'agis_ddmendpoint.json'
+
+        os.environ['X509_USER_CERT'] = args.x
+        os.environ['X509_USER_KEY'] = args.x
+        os.environ['X509_USER_PROXY'] = args.x
+        os.environ['GLOBUS_THREAD_MODEL'] = 'pthread'
+
+        #Summary dict
+        self.sumDict = {'LsDir': {'CRITICAL':'No smooth listing in Token.', 'OK':'Directories successfully listed.'},
+                        'Put': {'CRITICAL': 'Put failed for Token.', 'UNKNOWN': 'Del not run on Token.',
+                                'WARNING': 'Put failed for Token?', 'OK': 'Put successful in Token.'},
+                        'Del': {'CRITICAL': 'Del failed for Token.', 'UNKNOWN': 'Del not run on Token.',
+                                'WARNING': 'Del failed for Token?', 'OK': 'Del successful in Token.'},
+                        'Get': {'CRITICAL' : 'Get failed in Token.', 'WARNING' : 'Preliminary issues before running Get in Token.',
+                                'OK' : 'Get successful in Token.'}
+                        }
+
+        #Details dicts
+        self.detLsDir = {'CRITICAL':'No listing possible for Token directory; Error message:',
+                         'OK':'Token directory successfully listed; voila:'}
+
+        self.detPutDel = {'CRITICAL1': 'Put failed for Token; Error message:',
+                          'UNKNOWN1': 'Del not run on Token as preliminary copy failed; Error message:',
+                          'WARNING1': 'Put failed for Token, no error message delivered though.',
+                          'CRITICAL2': 'Del failed in Token; Error message:',
+                          'OK2': 'Put successful in Token (TIME s), deletion failed though; Error message:',
+                          'WARNING2': 'Del failed in Token, no error message delivered though',
+                          'OK3': 'Test successful (TIME s) in Token.'}
+
+        self.detGet = {'CRITICAL2' : 'Failed to stat test file from Token; Error message:',
+                       'CRITICAL' : 'Get and recovery both failed in Token. Error message:',
+                       'WARNING1' : 'Corrupted test file in Token and recovery not successful.',
+                       'WARNING2' : 'Failed to stat test file from Token and recovery not successful.',
+                       'WARNING' : 'Get failed and recovery too, with no delivered error message.',
+                       'OK' : 'File successfully fetched (TIME s) from Token.'}
+
+        #gfal2
+        gfal2.set_verbose(gfal2.verbose_level.verbose)#to be set from command line?
+        #creating the gfal2 context instance
+        self.ctx = gfal2.creat_context()
+        self.ctx.set_opt_string("SRM PLUGIN", "TURL_PROTOCOLS", "gsiftp:dcap:rfio")
+        self.ctx.set_opt_string("SRM PLUGIN", "CONN_TIMEOUT", str(self.childTimeout - 20))
+        self.params = self.ctx.transfer_parameters()
+        if self.protocol == 'srm':
+            self.params.checksum_check = True
+
+        self.resultsDicts = []
+
+        self.statusDict = {'OK': 0, 'WARNING': 1, 'CRITICAL': 2, 'UNKNOWN': 3}
+
+        testcheck = self.srcFileCheck()
+        self.testnames = (str(self.metrics)+' metric', str(args.metricprofile)+' tests profile')[self.metrics is None]
+        
+        logging.basicConfig(filename=self.workdir_metric+self.tmp_logfile, level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s', datefmt='%m/%d/%Y %H:%M:%S')
+        logging.info(' @@@@@@@@@@@@@@@@@@@@@@@@@   STARTING SAM ' + self.testnames + '; ' + testcheck + '  @@@@@@@@@@@@@@@@@@@@@@@@@')
+
+        self.execTest = []
+
+        if self.tokens:
+            self.tokens = self.tokens + ('_' + args.metricprofile).join([ ep for ep in self.tested_tokens ])
+
+
+
+    def uuidstr(self,lngt=12, chars='0123456789abcdef'):
+        return ''.join([choice(chars) for i in range(lngt)])
+
+    
+    def timeout_parser(self, tDict, test, token_list):
+        tDict['status'] = 'CRITICAL'
+        tDict['summary'] = test+' exceeded %s s for testing %s token(s)' % (str(self.childTimeout),len(token_list))
+        tDict['details'] = test + ' exceeded %s seconds after testing %s token(s)' % (str(self.childTimeout), ','.join(token_list)) + ' on ' + datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ')
+        return tDict
+
+    def srcFileCheck(self):
+        "Checks for or generates source file that will be put"
+
+        self._filePattern = self._filePattern % (str(int(time.time())),
+                                                       self.uuidstr())
+        
+        if os.path.isfile(self._fileTest):
+            return 'Local test file '+ self._fileTest +' found'
+        else:
+            fp = open(self._fileTest, "w")
+            for s in "1\n2\n3\n4\n5\n6\n7\n8\n9\n0": fp.write(s+'\n')
+            fp.close()
+            return 'Created new local test file'
+
+
+    def restoreGetFile(self, src, dest, preDel = False, getIt = False, lofile = ''):
+
+        self.params.overwrite = True
+        gogetit = ''
+        cp_intv = -1
+        if preDel:
+            try:
+                unl = self.ctx.unlink(dest)
+            except Exception, ex:
+                msg = '\n' + self.exc_msg.format(type(ex).__name__, ex.args)
+            else:
+                msg = 'success'
+        
+
+        if not preDel or (preDel and bool(msg == 'success' or 'not found' in msg ) ):
+            try:
+                fc = self.ctx.filecopy(self.params,src,dest)
+            except Exception, ex:
+                msg = '\n' + self.exc_msg.format(type(ex).__name__, ex.args)
+            else:
+                gogetit = str(dest)
+                msg = 'success'
+            if gogetit and getIt:
+                cp_start = datetime.datetime.now()
+                try:
+                    getout = self.ctx.filecopy(self.params,dest,lofile)
+                except Exception, ex:
+                    msg = '\n' + self.exc_msg.format(type(ex).__name__, ex.args)
+                else:
+                    cp_intv = str(datetime.datetime.now() - cp_start)
+                    msg = 'success'
+
+        return (gogetit, msg, cp_intv)
+                            
+
+    def createTestDict(self, testname):
+        repDict = {}
+        repDict['service'] = self.ns + '.' + self.workdir_service + '-' + self.protocol + '-' + testname + '-' + self.fqan
+        repDict['host'] = self.hostName
+        repDict['status'] = 'OK'
+        repDict['summary'] = ''
+        repDict['details'] = ''
+        return repDict
+
+    def processResult(self, repDict, tokDict, test):
+        n_crt = reduce(lambda x,y: x + y, [ ('CRITICAL' in vals[0]) and 1 or 0 for vals in tokDict.values() ])
+        n_wrn = reduce(lambda x,y: x + y, [ ('WARNING' in vals[0]) and 1 or 0 for vals in tokDict.values() ])
+        n_unk = reduce(lambda x,y: x + y, [ ('UNKNOWN' in vals[0]) and 1 or 0 for vals in tokDict.values() ])
+
+        t_crt = self.threshold * len(tokDict.keys())
+        t_wrn = self.wThreshold * len(tokDict.keys())
+        t_tok = self.tokThreshold * len(tokDict.keys())
+
+        if n_crt > t_tok:
+            status = (('OK','WARNING')[n_crt > t_wrn], 'CRITICAL')[n_crt > t_crt]
+            sumstr = (' overall outcome OK though', ' hence status turned' + status)['OK' not in status]
+            repDict['summary'] = test + ' failed in %s/%s token(s)%s\\n' % (str(n_crt), len(tokDict.keys()), sumstr)
+        elif n_wrn > t_tok:
+            status = ('OK','WARNING')[n_wrn > t_crt]
+            sumstr = (' overall outcome OK though', ' hence status turned' + status)['OK' not in status]
+            repDict['summary'] = test + ' warning in %s/%s token(s)%s\\n' % (str(n_wrn), len(tokDict.keys()), sumstr)
+        elif n_unk > t_tok:
+            status = ('OK','UNKNOWN')[n_unk > t_crt]
+            sumstr = (' overall outcome OK though', ' hence status turned' + status)['OK' not in status]
+            repDict['summary'] = test + ' unknown in %s/%s token(s)%s\\n' % (str(n_unk), len(tokDict.keys()), sumstr)
+        else:
+            if(n_crt + n_wrn + n_unk >= 2):
+                status = 'UNKNOWN'
+                repDict['summary'] = 'Mixed outcome in %s/%s token(s), look into details\\n' % (str(n_crt+n_wrn+n_unk), len(tokDict.keys()))
+            else:
+                status = 'OK'
+                repDict['summary'] = test + ' run successfully on %s!\\n' % (tokDict.keys()[0], 'all tokens')[len(tokDict.keys()) > 1]
+
+        repDict['details'].replace(repDict['status'], status)
+        repDict['details'] += '\\n' + repDict['summary']
+        repDict['status'] = status
+
+        return repDict
+
+
+    def testFlow(probe):
+
+        def test(self, token = '', path = '', **kwargs):
+            testForLog = probe.__name__ if len(kwargs.keys()) == 0 else kwargs['Test']
+            reportDict = self.createTestDict(testForLog)
+
+            signal.signal(signal.SIGALRM, timeout_handler)
+            tOut_result = signal.alarm(self.childTimeout)
+
+            tokenStates = {}
+            logging.info(" #########################  Starting " + testForLog + token + "  #########################")
+            try:
+                #for path in voInfoDictionary.keys():#il path e' dato da argument
+                logging.info(" Testing endpoint... " + path)
+                tokenTest = probe(self, token=token, path = path, **kwargs)#**{'path': path})#, 'voInfoDictionary': voInfoDictionary})#qui i kwargs mi sa non servono piu, basta mettere il path ab initio..
+                tokenTest[1] = tokenTest[1].replace('Token', token)#voInfoDictionary[path]['token'])
+                #   CRITICALITY  !!!!!!!!!
+                #if voInfoDictionary[path]['criticality'] and 'OK' not in tokenTest[0]:
+                #    reportDict['status'] = tokenTest[0]
+                tokenStates.update({ token : tokenTest })
+
+            except TimeoutException:
+                tDict = self.timeout_parser(reportDict, testForLog, tokenStates.keys())
+            tOut_zero = signal.alarm(0)
+
+            reportDict['details'] = '\n'.join([vals[1] for vals in tokenStates.values()])
+
+            ntests = 1#len(voInfoDictionary.keys())
+            if 'OK' in reportDict['status']:
+                if ntests > 1:
+                    reportDict = self.processResult(reportDict, tokenStates, testForLog)
+                else:
+                    reportDict['summary'] = reportDict['status'] + ': ' + (self.sumDict[testForLog][reportDict['status']].replace('Test', testForLog))
+            else:
+                reportDict['sumamry'] = reportDict['status'] + ': ' + (self.sumDict[testForLog][reportDict['status']].replace('Test', testForLog)) + ('', ' Issues for some/all tokens.')[ntests > 1]
+
+            logging.info(" Results dict:\t" + str(reportDict))
+            logging.info(" -------------------------  " + testForLog + token + " finished  -------------------------")
+            self.resultsDicts.append(reportDict)
+            #if 'LsDir' not in testForLog and not token:
+            print reportDict['summary'],'\n',reportDict['details']
+            return (reportDict['status'], reportDict['summary'])
+
+        return test
+
+
+    @testFlow
+    def LsDir(self, token = '', path = '', **kwargs):
+        list_command = str(path + ('',';offset=0;count=10')[self.protocol == 'srm'])
+        try:
+            ldir = self.ctx.listdir(list_command)
+        except Exception, ex:
+            tokStatus = 'CRITICAL'
+            err = self.exc_msg.format(type(ex).__name__, ex.args)
+            msg = self.detLsDir[tokStatus]+'\n'+str(err)+'\\n'
+        else:
+            tokStatus = 'OK'
+            msg = self.detLsDir[tokStatus]+'\n'+str(ldir)+'\\n'
+        return [tokStatus, msg]
+
+
+    @testFlow
+    def Put(self, token = '', path = '', **kwargs):
+        source = str('file://'+self._fileTest)
+        Test = 'Put' if len(kwargs.keys()) == 0 else kwargs['Test']
+        print 'TEST',Test,str(kwargs)
+        dest = str(path+self._filePattern.replace('TEST',Test.upper()).replace('TOKEN',token))
+        if token:
+            dest=dest.replace('.txt','-sgl.txt')
+        cp_start = datetime.datetime.now()
+        try:
+            print 'S',source,'D',dest
+            putout = self.ctx.filecopy(self.params, source, dest)
+        except Exception, ex:
+            tokStatus = ('UNKNOWN', ('WARNING','CRITICAL')[bool(ex.args[0])])[Test == 'Put']
+            err = self.exc_msg.format(type(ex).__name__, ex.args)
+            msg = self.detPutDel[tokStatus+'1'] + '\n' + err + '\\n'
+        else:
+            cp_intv = str(datetime.datetime.now() - cp_start)
+            time.sleep(3)
+            del_start = datetime.datetime.now()
+            try:
+                delout = self.ctx.unlink(dest)
+            except Exception, ex:
+                tokStatus = (('WARNING', 'CRITICAL')[bool(ex.args[0])],'OK')[Test == 'Put']
+                err = self.exc_msg.format(type(ex).__name__, ex.args)
+                msg = self.detPutDel[tokStatus+'2'] + '\n' + err + '\\n'
+                msg = msg.replace('TIME', cp_intv)
+            else:
+                del_intv = str(datetime.datetime.now() - del_start)
+                tokStatus = 'OK'
+                msg = self.detPutDel[tokStatus+'3'] + '\\n'
+                msg = msg.replace('TIME',(str(del_intv), str(cp_intv))[Test == 'Put'])
+        msg = msg.replace('Test',('Del', 'Put')[Test == 'Put'])
+        return [tokStatus, msg]
+
+
+    def Del(self, token = '', path = ''):
+        return self.Put(token = token, path = path, **{'Test':'Del'})
+
+    @testFlow
+    def Get(self, token = '', path = ''):
+        gfile = str(path+self._getFilePattern.replace('TOKEN',token))
+        dest = str('file://'+self._fileTestGet)
+        src = str('file://'+self._fileTest)
+        err = ''
+        self.params.overwrite = True
+        stat_start = datetime.datetime.now()
+        try:
+            lfile = self.ctx.stat(gfile)
+        except Exception, ex:
+            err = self.exc_msg.format(type(ex).__name__, ex.args)
+        else:
+            stat_intv = datetime.datetime.now() - stat_start
+            if self.protocol == 'srm':
+                cs_start = datetime.datetime.now()
+                local_cs = self.ctx.checksum(src, 'adler32')
+                cs_err = ''
+                try:
+                    se_cs = self.ctx.checksum(gfile, 'adler32')
+                except Exception, ex:
+                    cs_err = self.exc_msg.format(type(ex).__name__, ex.args)
+                if se_cs != local_cs or cs_err != self.exc_msg:
+                    cs_intv = datetime.datetime.now() - cs_start
+                    rest_out = self.restoreGetFile(src, gfile)
+                    
+                    if rest_out[1] != 'success':
+                        tokStatus = 'WARNING'
+                        msg = self.detGet[tokStatus+'1'] + '\n' + rest_out[1] + '\\n'
+                        msg = msg.replace('TIME', 'Stat: ' + str(stat_intv) + ', CS: ' + str(cs_intv) + ', Rec: ' + str(rest_out[2]))
+                        return [tokStatus, msg]
+                    else:
+                        getit = rest_out[0]
+                else:
+                    getit = str(lfile)
+            else:
+                getit = str(lfile)
+
+        if ('such file' in err or 'size: 0' in err):
+            rest_out = self.restoreGetFile(src, gfile)
+            if rest_out[1] != 'success':
+                tokStatus = 'WARNING'
+                msg = self.detGet[tokStatus+'1'] + '\n' + rest_out[1] + '\\n'
+                msg = msg.replace('TIME', 'Stat: ' + str(stat_intv) + ', Rec: ' + str(rest_out[2]))
+                return [tokStatus, msg]
+            else:
+                getit = rest_out[0]
+        elif err != '':
+            tokStatus = ('WARNING','CRITICAL')[bool(err)]
+            msg = self.detGet[tokStatus+'2'] + '\n' + err + '\\n'
+            return [tokStatus, msg]
+        else:
+            getit = str(lfile)
+
+        if getit:
+            self.params.src_spacetoken = token
+            cp_start = datetime.datetime.now()
+            try:
+                getout = self.ctx.filecopy(self.params, gfile, dest)
+            except Exception, ex:
+                cp_intv = datetime.datetime.now() - cp_start
+                err = self.exc_msg.format(type(ex).__name__, ex.args)
+                rest_out = self.restoreGetFile(src, gfile)
+                tokStatus = ('CRITICAL','OK')[ rest_out[1] == 'success' ]
+                msg = self.detGet[tokStatus] + ('\n' + err, '')[ rest_out[1] == 'success' ] + '\\n'
+                msg = msg.replace('TIME', 'FC: ' + str(cp_intv) + ', Rec: ' + str(rest_out[2]))
+            else:
+                cp_intv = str(datetime.datetime.now() - cp_start)
+                tokStatus = 'OK'
+                msg = self.detGet[tokStatus] + '\\n'
+                msg = msg.replace('TIME', cp_intv)
+        return [tokStatus, msg]
+
+
+    def PutATLASDATADISK(self):
+        return self.Put(token = 'ATLASDATADISK')
+            
+    def PutATLASSCRATCHDISK(self):
+        return self.Put(token = 'ATLASSCRATCHDISK')
+
+    def PutATLASGROUPDISK(self):
+        return self.Put(token = 'ATLASGROUPDISK')
+
+    def PutATLASLOCALGROUPDISK(self):
+        return self.Put(token = 'ATLASLOCALGROUPDISK')
+
+    def DelATLASDATADISK(self):
+        return self.Del(token = 'ATLASDATADISK')
+            
+    def DelATLASSCRATCHDISK(self):
+        return self.Del(token = 'ATLASSCRATCHDISK')
+
+    def DelATLASGROUPDISK(self):
+        return self.Del(token = 'ATLASGROUPDISK')
+
+    def DelATLASLOCALGROUPDISK(self):
+        return self.Del(token = 'ATLASLOCALGROUPDISK')
+
+    def GetATLASDATADISK(self):
+        return self.Get(token = 'ATLASDATADISK')
+            
+    def GetATLASSCRATCHDISK(self):
+        return self.Get(token = 'ATLASSCRATCHDISK')
+
+    def GetATLASGROUPDISK(self):
+        return self.Get(token = 'ATLASGROUPDISK')
+
+    def GetATLASLOCALGROUPDISK(self):
+        return self.Get(token = 'ATLASLOCALGROUPDISK')
+
+
+    def execFlow(self):
+        
+        exStatus = 'OK'
+        if self.metrics:
+            out = getattr(self,self.metrics[0])(token=self.actedtokens[0], path=self.endpoints[0])
+            if self.metrics[0] in ('Put', 'Get', 'Del'):
+                exStatus = out[0]
+                status = out[0]
+                summary = out[1]
+
+            self.execTest.append(self.metrics[0])
+
+        elif self.tokens:
+            actualTests = self.tokens.split('_')[:2]
+            actualTests.extend([self.tokens.split('_')[1]+val['token'] for val in self._voInfoDictionary.values()])
+            for mtc in actualTests:
+                out = getattr(self,mtc)()
+
+                if mtc == 'LsDir' and out[0] == 'CRITICAL':
+                    exStatus = 'CRITICAL'
+                    status = 'CRITICAL'
+                    summary = 'LsDir failed, whole test chain is being interrupted'
+                    #break: rimetterlo e creare il dizionario fatt'apposta?
+                if mtc in ('Put', 'Get', 'Del'):
+                    exStatus = out[0]
+                    status = out[0]
+                    summary = out[1]
+
+                self.execTest.append(mtc)
+
+        else:
+            logging.critical('No compliant option provided')
+
+        logging.info(' %%%%%%%%%%%%%%%%%%%%%%%%%   SAM ' + self.testnames + ' FINISHED  %%%%%%%%%%%%%%%%%%%%%%%%%')
+        return self.statusDict[exStatus]
+                            
+#####################################################################################################################
+
+ddmvom = DDMMetrics()
+
+#status = ''
+#summary = ''
+ext = ddmvom.execFlow()
+
+
+if ext != 0:
+    tmplog = open(ddmvom.workdir_metric+ddmvom.tmp_logfile,'r')
+    logdata = tmplog.read()
+    tmplog.close()
+    log = open(ddmvom.workdir_metric+ddmvom.logfile,'a')
+    log.write(logdata)
+    log.close()
+    #if status:
+    #    print status,'\n',summary
+    os.remove(ddmvom.workdir_metric+ddmvom.tmp_logfile)
+
+try:
+    pas = nagios.publishPassiveResult(ddmvom.resultsDicts)
+except IOError, e:
+    print "IOError", e
+except nagios.ErrNagiosLib, enl:
+    print "ErrNagiosLib", enl
+
+sys.exit(ext)
