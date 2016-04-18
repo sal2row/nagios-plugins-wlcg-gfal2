@@ -237,6 +237,7 @@ class DDMMetrics(object):
         self.ctx = gfal2.creat_context()
         self.ctx.set_opt_string("SRM PLUGIN", "TURL_PROTOCOLS", "gsiftp:dcap:rfio")
         self.ctx.set_opt_string("SRM PLUGIN", "CONN_TIMEOUT", str(self.childTimeout - 20))
+        self.ctx.set_opt_string("SRM PLUGIN", "OPERATION_TIMEOUT", str(self.childTimeout - 25))
         self.params = self.ctx.transfer_parameters()
         if self.protocol == 'srm':
             self.params.checksum_check = True
